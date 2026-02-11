@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use crate::aws::commit::{PutCommit, RedisCommit};
 use crate::config::Parse;
 
 use itertools::Itertools;
@@ -114,7 +117,7 @@ impl Parse for S3CopyIfNotExists {
 /// Configure how to provide conditional put support for [`AmazonS3`].
 ///
 /// [`AmazonS3`]: super::AmazonS3
-#[derive(Debug, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 #[allow(missing_copy_implementations)]
 #[non_exhaustive]
 pub enum S3ConditionalPut {
@@ -127,35 +130,67 @@ pub enum S3ConditionalPut {
     #[default]
     ETagMatch,
 
+    /// Use an external commit protocol for conditional put coordination.
+    ///
+    /// This is useful for S3-compatible stores that do not support
+    /// `If-Match` / `If-None-Match` headers. The [`PutCommit`] implementation
+    /// provides mutual exclusion so that a HEAD + PUT sequence is atomic.
+    ///
+    /// Encoded as `redis://<host>:<port>[/<db>]` or `rediss://...` for TLS.
+    Commit(Arc<dyn PutCommit>),
+
     /// Disable `conditional put`
     Disabled,
+}
+
+impl PartialEq for S3ConditionalPut {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ETagMatch, Self::ETagMatch) => true,
+            (Self::Disabled, Self::Disabled) => true,
+            (Self::Commit(_), Self::Commit(_)) => {
+                Arc::ptr_eq(self.commit_arc().unwrap(), other.commit_arc().unwrap())
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for S3ConditionalPut {}
+
+impl S3ConditionalPut {
+    fn commit_arc(&self) -> Option<&Arc<dyn PutCommit>> {
+        match self {
+            Self::Commit(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for S3ConditionalPut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ETagMatch => write!(f, "etag"),
+            Self::Commit(_) => write!(f, "commit"),
             Self::Disabled => write!(f, "disabled"),
-        }
-    }
-}
-
-impl S3ConditionalPut {
-    fn from_str(s: &str) -> Option<Self> {
-        match s.trim() {
-            "etag" => Some(Self::ETagMatch),
-            "disabled" => Some(Self::Disabled),
-            _ => None,
         }
     }
 }
 
 impl Parse for S3ConditionalPut {
     fn parse(v: &str) -> crate::Result<Self> {
-        Self::from_str(v).ok_or_else(|| crate::Error::Generic {
-            store: "Config",
-            source: format!("Failed to parse \"{v}\" as S3PutConditional").into(),
-        })
+        match v.trim() {
+            "etag" => Ok(Self::ETagMatch),
+            "disabled" => Ok(Self::Disabled),
+            s if s.starts_with("redis://") || s.starts_with("rediss://") => {
+                let commit = RedisCommit::new(s)?;
+                Ok(Self::Commit(Arc::new(commit)))
+            }
+            _ => Err(crate::Error::Generic {
+                store: "Config",
+                source: format!("Failed to parse \"{v}\" as S3ConditionalPut").into(),
+            }),
+        }
     }
 }
 
