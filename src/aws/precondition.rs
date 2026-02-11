@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use crate::aws::commit::{PutCommit, RedisCommit};
 use crate::aws::dynamo::DynamoCommit;
 use crate::config::Parse;
 
@@ -129,7 +132,7 @@ impl Parse for S3CopyIfNotExists {
 /// Configure how to provide conditional put support for [`AmazonS3`].
 ///
 /// [`AmazonS3`]: super::AmazonS3
-#[derive(Debug, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 #[allow(missing_copy_implementations)]
 #[non_exhaustive]
 pub enum S3ConditionalPut {
@@ -141,6 +144,15 @@ pub enum S3ConditionalPut {
     /// [HTTP precondition]: https://datatracker.ietf.org/doc/html/rfc9110#name-preconditions
     #[default]
     ETagMatch,
+
+    /// Use an external commit protocol for conditional put coordination.
+    ///
+    /// This is useful for S3-compatible stores that do not support
+    /// `If-Match` / `If-None-Match` headers. The [`PutCommit`] implementation
+    /// provides mutual exclusion so that a HEAD + PUT sequence is atomic.
+    ///
+    /// Encoded as `redis://<host>:<port>[/<db>]` or `rediss://...` for TLS.
+    Commit(Arc<dyn PutCommit>),
 
     /// The name of a DynamoDB table to use for coordination
     ///
@@ -157,10 +169,26 @@ pub enum S3ConditionalPut {
     Disabled,
 }
 
+impl PartialEq for S3ConditionalPut {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ETagMatch, Self::ETagMatch) => true,
+            (Self::Disabled, Self::Disabled) => true,
+            (Self::Commit(a), Self::Commit(b)) => Arc::ptr_eq(a, b),
+            #[allow(deprecated)]
+            (Self::Dynamo(a), Self::Dynamo(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for S3ConditionalPut {}
+
 impl std::fmt::Display for S3ConditionalPut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ETagMatch => write!(f, "etag"),
+            Self::Commit(_) => write!(f, "commit"),
             #[allow(deprecated)]
             Self::Dynamo(lock) => write!(f, "dynamo: {}", lock.table_name()),
             Self::Disabled => write!(f, "disabled"),
@@ -184,6 +212,12 @@ impl S3ConditionalPut {
 
 impl Parse for S3ConditionalPut {
     fn parse(v: &str) -> crate::Result<Self> {
+        let trimmed = v.trim();
+        // Handle redis:// and rediss:// URLs directly
+        if trimmed.starts_with("redis://") || trimmed.starts_with("rediss://") {
+            let commit = RedisCommit::new(trimmed)?;
+            return Ok(Self::Commit(Arc::new(commit)));
+        }
         Self::from_str(v).ok_or_else(|| crate::Error::Generic {
             store: "Config",
             source: format!("Failed to parse \"{v}\" as S3PutConditional").into(),

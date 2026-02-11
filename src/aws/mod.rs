@@ -55,6 +55,7 @@ static COPY_SOURCE_HEADER: HeaderName = HeaderName::from_static("x-amz-copy-sour
 mod builder;
 mod checksum;
 mod client;
+pub mod commit;
 mod credential;
 mod dynamo;
 mod precondition;
@@ -64,6 +65,7 @@ mod resolve;
 
 pub use builder::{AmazonS3Builder, AmazonS3ConfigKey};
 pub use checksum::Checksum;
+pub use commit::{CommitLock, PutCommit, RedisCommit};
 pub use dynamo::DynamoCommit;
 pub use precondition::{S3ConditionalPut, S3CopyIfNotExists};
 
@@ -202,6 +204,33 @@ impl ObjectStore for AmazonS3 {
                 d.conditional_op(&self.client, location, None, move || request.do_put())
                     .await
             }
+            (PutMode::Create, S3ConditionalPut::Commit(commit)) => {
+                let lock = commit.lock(location).await?;
+                let op = async {
+                    match self
+                        .get_opts(location, GetOptions { head: true, ..Default::default() })
+                        .await
+                    {
+                        Ok(_) => Err(Error::AlreadyExists {
+                            path: location.to_string(),
+                            source: "Object already exists (checked under lock)".into(),
+                        }),
+                        Err(Error::NotFound { .. }) => {
+                            request.idempotent(true).do_put().await
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                match tokio::time::timeout_at(lock.deadline, op).await {
+                    Ok(r) => r,
+                    Err(_) => Err(Error::Generic {
+                        store: STORE,
+                        source: "Conditional operation timed out — lock may have expired"
+                            .to_string()
+                            .into(),
+                    }),
+                }
+            }
             (PutMode::Update(v), put) => {
                 let etag = v.e_tag.ok_or_else(|| Error::Generic {
                     store: STORE,
@@ -235,6 +264,45 @@ impl ObjectStore for AmazonS3 {
                             request.do_put()
                         })
                         .await
+                    }
+                    S3ConditionalPut::Commit(commit) => {
+                        let lock = commit.lock(location).await?;
+                        let op = async {
+                            let meta = match self
+                                .get_opts(location, GetOptions { head: true, ..Default::default() })
+                                .await
+                            {
+                                Ok(r) => r.meta,
+                                Err(Error::NotFound { path, .. }) => {
+                                    return Err(Error::Precondition {
+                                        path,
+                                        source: "Object does not exist (checked under lock)"
+                                            .into(),
+                                    });
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            let current_etag = meta.e_tag.as_deref().unwrap_or("");
+                            if current_etag != etag.as_str() {
+                                return Err(Error::Precondition {
+                                    path: location.to_string(),
+                                    source: format!(
+                                        "ETag mismatch: expected {etag}, found {current_etag}"
+                                    )
+                                    .into(),
+                                });
+                            }
+                            request.idempotent(true).do_put().await
+                        };
+                        match tokio::time::timeout_at(lock.deadline, op).await {
+                            Ok(r) => r,
+                            Err(_) => Err(Error::Generic {
+                                store: STORE,
+                                source: "Conditional operation timed out — lock may have expired"
+                                    .to_string()
+                                    .into(),
+                            }),
+                        }
                     }
                     S3ConditionalPut::Disabled => Err(Error::NotImplemented),
                 }
