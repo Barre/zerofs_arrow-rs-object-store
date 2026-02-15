@@ -76,7 +76,7 @@ const UNLOCK_SCRIPT: &str =
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 
 /// Default lock TTL (safety net for crash recovery).
-const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(300);
 
 /// Safety margin subtracted from the lock TTL to produce the operation deadline.
 /// Accounts for network round-trip, scheduling delays, and clock skew.
